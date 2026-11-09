@@ -113,7 +113,7 @@ pre.rtext{white-space:pre-wrap;font:inherit;font-size:.88rem;margin:6px 0;backgr
   </div>
 </header>
 <main id="main"></main>
-<footer>The PD plan, the AI’s lines, and the form stay in your browser. Only the evaluation results are sent to the division log when you press “Save to the log”. The evaluator reviews, signs, and decides.</footer>
+<footer>The PD plan, the AI’s lines, and the form stay in your browser. The evaluation results (not the PD plan) are sent to the division log automatically when you reach Step 4, and the same record is updated if you change anything afterwards. The evaluator reviews, signs, and decides.</footer>
 
 <script>
 /* ===== SETTINGS =====
@@ -537,7 +537,7 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
   }
   var state = {
     step: 1, pasted: '', meta: newMeta(lsGet('pdqa_eval')), rows: null, recs: [], filter: 'all', recManual: { compliance: null, tech: null }, parseInfo: null,
-    clientKey: uuid(), saved: null, schoolHint: '',
+    clientKey: uuid(), saved: null, schoolHint: '', dirty: false, saving: null, pending: false, saveErr: null, saveTimer: null,
     net: { code: lsGet('pdqa_code'), connected: false, config: null, programs: null, detail: null, detailFor: '', resubAll: false, log: null }
   };
   var $main = document.getElementById('main'), $stepper = document.getElementById('stepper');
@@ -583,6 +583,7 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
     if (e === 'network') return 'Could not reach the log. Check the internet connection and the Web App URL in the app settings.';
     if (e === 'validation') return 'The log rejected this evaluation: ' + (j.details || []).join(' · ');
     if (e === 'program_not_found') return 'That program was not found in the log.';
+    if (e === 'saved_to_other_program') return 'This evaluation was already saved to program ' + ((j.details || [''])[0]) + '. Start a new evaluation to log it somewhere else.';
     if (e === 'sheet_columns_outdated') return 'The log sheet columns are out of date (' + ((j.details || []).join(', ')) + '). In Apps Script, clear the old test rows in the tabs and run setupSheets again (see the setup guide).';
     return 'The log answered with an error' + (e ? ' (' + e + ')' : '') + '.';
   }
@@ -619,6 +620,65 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
     if (!programId) return Promise.resolve(null);
     return api('program', { programId: programId }).then(function (j) { if (j.ok && state.net.detailFor === programId) state.net.detail = j; return j; });
   }
+
+  /* ---------- automatic saving to the division log ---------- */
+  function logReady() { return logOn() && state.net.connected; }
+  function buildPayload(chk) {
+    var m = state.meta, model = finalModel();
+    return {
+      clientKey: state.clientKey, promptVersion: D.PROMPT_VERSION,
+      program: { programId: m.mode === 'resub' ? m.programId : '', district: m.district, school: schoolName(), proponent: (m.proponent || '').trim(), title: (m.title || '').trim(), type: m.type || 'Not stated', dateReceived: m.dateReceived || '' },
+      submission: { evaluator: (m.evaluator || '').trim() },
+      criteria: state.rows.map(function (r, i) {
+        var rt = ratingOf(r), gap = rt && rt !== 'FULLY';
+        return { id: r.id, component: STD[i].comp, rating: rt, marks: r.marks.every(function (x) { return x !== null; }) ? r.marks.map(function (x) { return x ? 'Y' : 'N'; }).join('') : '', aiRating: r.aiRating || '', evidence: r.loc || '',
+          comments: gap ? r.items.map(function (c) { return { verb: c.verb.trim(), elements: c.elements.trim(), qual: c.qual.trim() }; }) : [] };
+      }),
+      recs: chk.recs.map(function (r) { return { ids: String(r.ids).replace(/\s+/g, ''), verb: r.verb.trim(), q1: r.q1.trim(), elements: r.elements.trim(), q2: r.q2.trim() }; }),
+      recommendation: { yes: model.rec.yes, returnFor: model.rec.yes ? [] : (model.rec.compliance ? ['compliance'] : []).concat(model.rec.tech ? ['technical_assistance'] : []) }
+    };
+  }
+  function autoSave() {
+    if (!state.rows || !logReady()) return Promise.resolve(null);
+    var chk = logChecks();
+    if (!chk.ok || counts().blocks > 0) { updateLogStats(); return Promise.resolve(null); }
+    if (state.saving) { state.pending = true; return state.saving; }
+    state.dirty = false; state.saveErr = null;
+    state.saving = api('submit', null, buildPayload(chk)).then(function (j) {
+      state.saving = null;
+      if (j && j.ok) { state.saved = { programId: j.programId, submissionNo: j.submissionNo, at: new Date() }; state.net.programs = null; state.net.log = null; state.saveErr = null; }
+      else { state.saveErr = j || { error: 'network' }; state.dirty = true; }
+      updateLogStats();
+      if (state.pending) { state.pending = false; scheduleAutoSave(300); }
+      return j;
+    });
+    updateLogStats();
+    return state.saving;
+  }
+  function scheduleAutoSave(ms) { clearTimeout(state.saveTimer); state.saveTimer = setTimeout(function () { autoSave(); }, ms); }
+  function touch() { // the evaluator changed something
+    if (!logOn()) return;
+    state.dirty = true;
+    if (state.saved && logReady()) scheduleAutoSave(4000);
+    updateLogStats();
+  }
+  function renderLogStat(el) {
+    el.innerHTML = '';
+    if (!logOn()) return;
+    var t;
+    if (!state.net.connected) t = msg('info', 'Not connected to the division log yet. Connect in Step 4 (or on the Log page) and this evaluation is saved automatically.');
+    else if (state.saving) t = msg('info', 'Saving to the division log…');
+    else if (state.saveErr) {
+      t = msg('bad', errText(state.saveErr));
+      t.appendChild(h('button', { class: 'btn small', type: 'button', style: 'margin-left:8px', text: 'Retry now', onclick: function () { autoSave(); } }));
+    } else if (state.saved && state.dirty) t = msg('info', 'Changes will be saved to the log in a moment…');
+    else if (state.saved) {
+      var d = state.saved.at, hh = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+      t = msg('ok', 'Saved to the division log: Submission #' + state.saved.submissionNo + ' of ' + state.saved.programId + ' (' + hh + '). Changes are saved automatically.');
+    } else t = msg('warn', 'Not saved to the log yet. It is saved automatically when you reach Step 4 and the checklist there is complete.');
+    el.appendChild(t);
+  }
+  function updateLogStats() { document.querySelectorAll('.logstat').forEach(renderLogStat); }
 
   /* ---------- rows ---------- */
   function buildRows(parsed) {
@@ -790,7 +850,7 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
     }
     state.recs = (p.recs || []).map(function (r) { return { ids: r.ids, verb: r.verb, q1: r.q1, elements: r.elements, q2: r.q2, loose: r.loose }; });
     state.recManual = { compliance: null, tech: null };
-    state.clientKey = uuid(); state.saved = null; state.net.detail = null; state.net.detailFor = '';
+    clearTimeout(state.saveTimer); state.clientKey = uuid(); state.saved = null; state.dirty = false; state.saving = null; state.pending = false; state.saveErr = null; state.net.detail = null; state.net.detailFor = '';
   }
   function renderResults() {
     var ta = h('textarea', { id: 'pasted', rows: 14, 'aria-label': 'The AI’s result lines', placeholder: 'HEADER|title:...|type:INSET|school:...|proponent:...\nS01|PARTIAL|YNY|loc:...|remark:Specify // the PPST domain, strand, and indicator for Sessions 1 and 6 // as these sessions state none ;; Name // ... // ...\n...\nREC|S07,S08|Revise|all|session objectives|so that each states a measurable target.', spellcheck: 'false' });
@@ -869,9 +929,11 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
     var r1 = h('input', { type: 'radio', name: 'mode', id: 'modeNew', value: 'new' }); r1.checked = m.mode === 'new';
     var r2 = h('input', { type: 'radio', name: 'mode', id: 'modeRe', value: 'resub' }); r2.checked = m.mode === 'resub';
     var reBox = h('div', { class: m.mode === 'resub' ? '' : 'hide' });
+    if (state.saved) { r1.disabled = true; r2.disabled = true; }
     r1.addEventListener('change', function () { if (r1.checked) { m.mode = 'new'; m.programId = ''; state.net.detail = null; renderMeta(box); state.refreshLogChecks && state.refreshLogChecks(); } });
     r2.addEventListener('change', function () { if (r2.checked) { m.mode = 'resub'; renderMeta(box); state.refreshLogChecks && state.refreshLogChecks(); } });
     box.appendChild(h('div', { style: 'margin-top:12px' }, h('h3', { text: 'Submission' }),
+      state.saved ? h('p', { class: 'small muted', text: 'Already saved to the log as Submission #' + state.saved.submissionNo + ' of ' + state.saved.programId + '. The choice below is locked; changes you make update that same record. Start a new evaluation to log another one.' }) : null,
       h('label', { class: 'radio' }, r1, h('span', { text: 'First submission of this program' })),
       h('label', { class: 'radio' }, r2, h('span', { text: 'Resubmission (second or later) of a program already in the log' })), reBox, sim));
     if (m.mode === 'resub') fillResub(reBox, box);
@@ -887,7 +949,7 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
       if (!list) { reBox.appendChild(msg('bad', 'Could not load the programs from the log.')); return; }
       var all = state.net.resubAll, sch = m.school === '__other__' ? m.schoolOther : m.school;
       var rel = list.filter(function (p) { return all || (m.district && sch && p.District === m.district && QA.normSchool(p.School) === QA.normSchool(sch)); });
-      var sel = h('select', { id: 'mProgram', 'aria-label': 'Program in the log' }, opt('', rel.length ? 'Choose the program' : 'No logged program for this school'));
+      var sel = h('select', { id: 'mProgram', 'aria-label': 'Program in the log', disabled: !!state.saved }, opt('', rel.length ? 'Choose the program' : 'No logged program for this school'));
       rel.forEach(function (p) { sel.appendChild(opt(p.ProgramID, (all ? p.School + ' — ' : '') + p.Title + '  (' + p.ProgramID + ', ' + p.LatestSubmissionNo + ' submission' + (Number(p.LatestSubmissionNo) === 1 ? '' : 's') + ', latest ' + (p.LatestResult === 'Yes' ? 'Yes' : 'No') + ')', m.programId === p.ProgramID)); });
       sel.addEventListener('change', function () {
         m.programId = sel.value; state.saved = null;
@@ -911,7 +973,7 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
     var m = state.meta;
     if (m.mode !== 'new' || !state.net.programs || !m.title) return;
     var sch = m.school === '__other__' ? m.schoolOther : m.school;
-    var sim = state.net.programs.filter(function (p) { return m.district && sch && p.District === m.district && QA.normSchool(p.School) === QA.normSchool(sch) && QA.titleSimilarity(p.Title, m.title) >= 0.6; });
+    var sim = state.net.programs.filter(function (p) { return !(state.saved && p.ProgramID === state.saved.programId) && m.district && sch && p.District === m.district && QA.normSchool(p.School) === QA.normSchool(sch) && QA.titleSimilarity(p.Title, m.title) >= 0.6; });
     if (!sim.length) return;
     var p = sim[0];
     box.appendChild(msg('warn', 'This looks like a program already in the log: “' + p.Title + '” (' + p.ProgramID + ', ' + p.LatestSubmissionNo + ' submission(s)). If this is a second submission, choose Resubmission above so the history stays together.'));
@@ -939,7 +1001,7 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
     var recsBox = h('div', { class: 'card', id: 'recsBox' }); $main.appendChild(recsBox); renderRecs(recsBox);
     var bar = h('div', { class: 'stickybar' }); $main.appendChild(bar);
 
-    function refreshAll() {
+    function refreshAll(initial) {
       var c = counts();
       sum.innerHTML = '';
       sum.appendChild(h('span', { class: 'pill ok', text: 'Fully ' + c.FULLY }));
@@ -952,9 +1014,11 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
       renderRec(recBox);
       renderBar(bar, c);
       renderStepper();
+      if (initial !== true) touch();
     }
     state.refreshAll = refreshAll;
-    refreshAll();
+    ['input', 'change'].forEach(function (ev) { metaBox.addEventListener(ev, function () { touch(); }); });
+    refreshAll(true);
   }
   function applyFilter() {
     var f = state.filter;
@@ -980,6 +1044,7 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
       state.filter = 'attention'; applyFilter(); var el = document.getElementById('c-' + ids[0]); if (el) el.scrollIntoView({ block: 'start' });
     } }));
     bar.appendChild(row);
+    var ls = h('div', { class: 'logstat', 'aria-live': 'polite' }); bar.appendChild(ls); renderLogStat(ls);
   }
   function renderRec(box) {
     box.innerHTML = '';
@@ -1006,7 +1071,7 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
       var prev = h('div', { class: 'prev' }), prob = h('div', { class: 'small' });
       function fld(label, key, ph) {
         var inp = h('input', { type: 'text', value: r[key] || '', placeholder: ph, 'aria-label': 'Recommendation ' + (i + 1) + ' ' + label });
-        inp.addEventListener('input', function () { r[key] = inp.value; r.loose = false; upd(); });
+        inp.addEventListener('input', function () { r[key] = inp.value; r.loose = false; upd(); touch(); });
         return h('div', null, h('label', { class: 'f', text: label }), inp);
       }
       function upd() {
@@ -1021,13 +1086,13 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
         fld('3 · PD program element(s) of concern', 'elements', 'session objectives and program-level objectives'),
         fld('4 · Qualifier', 'q2', 'so that each states a measurable target and a deadline'),
         h('div', { class: 'small muted', style: 'margin-top:6px', text: 'Reads as:' }), prev, prob,
-        h('div', { class: 'row', style: 'margin-top:6px' }, h('button', { class: 'btn small', type: 'button', text: 'Remove', onclick: function () { state.recs.splice(i, 1); renderRecs(box); state.refreshLogChecks && state.refreshLogChecks(); } })));
+        h('div', { class: 'row', style: 'margin-top:6px' }, h('button', { class: 'btn small', type: 'button', text: 'Remove', onclick: function () { state.recs.splice(i, 1); renderRecs(box); touch(); } })));
       list.appendChild(row); upd();
     });
     box.appendChild(list);
     var cnt = state.rows ? counts() : null;
     if (!state.recs.length) box.appendChild(h('p', { class: 'muted small', text: cnt && cnt.PARTIAL + cnt.NOT === 0 && !cnt.none ? 'No recommendations are needed when every standard is Fully Evident.' : 'No recommendation lines yet. Add at least one before saving to the log.' }));
-    box.appendChild(h('button', { class: 'btn', type: 'button', text: 'Add a recommendation', onclick: function () { state.recs.push({ ids: '', verb: '', q1: '', elements: '', q2: '' }); renderRecs(box); } }));
+    box.appendChild(h('button', { class: 'btn', type: 'button', text: 'Add a recommendation', onclick: function () { state.recs.push({ ids: '', verb: '', q1: '', elements: '', q2: '' }); renderRecs(box); touch(); } }));
   }
   function buildCard(s, r) {
     var el = h('section', { class: 'card std', id: 'c-' + s.id });
@@ -1083,7 +1148,7 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
       if (c.none) sum.appendChild(h('span', { class: 'pill', text: 'Not rated ' + c.none }));
       sum.appendChild(h('span', { class: 'pill' + (c.attention ? ' warn' : ' ok'), text: 'Needs attention ' + c.attention }));
       renderBar(document.querySelector('.stickybar'), c); renderStepper();
-      cardRefs[s.id].refresh(true);
+      cardRefs[s.id].refresh(true); touch();
     }
     function refresh(keepText) {
       var rt = ratingOf(r), d = QA.derive(r.marks);
@@ -1198,6 +1263,7 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
     var recBtn = h('button', { class: 'btn', type: 'button', text: 'Download the recommendations (.txt)', disabled: !state.recs.length });
     buildBtn.addEventListener('click', function () {
       status.innerHTML = ''; buildBtn.disabled = true;
+      if (logReady() && (!state.saved || state.dirty)) autoSave();
       var fname = 'QA_Tool_' + slug(model.header.title) + '_AI-DRAFT.docx';
       if (typeof JSZip === 'undefined') { note('The file builder could not load (no connection to the library host). Check the internet connection and reload this page.', 'bad'); buildBtn.disabled = false; return; }
       QA.buildDocx(JSZip, D.TEMPLATE_B64, model).then(function (res) {
@@ -1214,60 +1280,42 @@ window.QA_DATA = {"STD": [{"id": "S01", "comp": "Strength of Research Base", "te
     $main.appendChild(h('div', { class: 'card' }, h('p', { text: 'The form is the official QA Tool inside this app, with only the ticks, remarks, header lines, and recommendation filled in. Before it saves, the app checks that every other part of the file is identical to the official template.' }),
       h('div', { class: 'row' }, buildBtn, csvBtn, recBtn), status));
 
-    // ---- log card
+    // ---- log card (saves automatically)
     var logCard = h('div', { id: 'logCard' }); $main.appendChild(logCard);
     function drawLog() {
       logCard.innerHTML = '';
       if (!logOn()) { logCard.appendChild(h('div', { class: 'card' }, h('h3', { text: 'Division log' }), h('p', { class: 'small muted', text: 'This copy of the app is not connected to the division log (no Web App URL in the app settings), so results are not saved. The form and the files above still work.' }))); return; }
-      if (!state.net.connected) { logCard.appendChild(codeCard(function () { drawLog(); })); return; }
+      if (!state.net.connected) { logCard.appendChild(h('div', { class: 'logstat' })); logCard.firstChild.appendChild(msg('warn', 'This evaluation is not in the division log yet. Enter the access code below; it is then saved automatically.')); logCard.appendChild(codeCard(function () { drawLog(); })); return; }
       var m = state.meta, chk = logChecks();
-      var card = h('div', { class: 'card' }, h('h3', { text: 'Save this evaluation to the division log' }));
-      card.appendChild(h('p', { class: 'small', text: m.mode === 'new' ? 'This will be recorded as the FIRST submission of a new program.' : 'This will be recorded as a RESUBMISSION (the next submission number of the chosen program).' }));
+      var card = h('div', { class: 'card' }, h('h3', { text: 'Division log — saved automatically' }));
+      card.appendChild(h('p', { class: 'small', text: m.mode === 'new' ? 'This evaluation is recorded as the FIRST submission of a new program.' : 'This evaluation is recorded as a RESUBMISSION (the next submission number of the chosen program).' }));
+      card.appendChild(h('p', { class: 'small muted', text: 'You do not need to press anything: the results are sent to the log when you reach this step, and the same record is updated if you change anything afterwards.' }));
       var ul = h('ul', { class: 'chk' }); chk.items.forEach(function (x) { ul.appendChild(h('li', { class: x.ok ? 'ok' : 'no', text: x.text })); }); card.appendChild(ul);
-      if (!chk.ok) card.appendChild(h('p', { class: 'small muted', text: 'Go back to Step 3 (Program details and Written recommendations) to complete the items marked ✗.' }));
+      if (!chk.ok) card.appendChild(h('p', { class: 'small muted', text: 'Not saved yet. Go back to Step 3 (Program details and Written recommendations) to complete the items marked ✗; it is then saved automatically.' }));
       if (m.mode === 'resub' && m.programId && state.net.detail && state.net.detail.submissions && state.net.detail.submissions.length) {
-        var subs = state.net.detail.submissions, last = subs[subs.length - 1];
-        var nowMap = {}; state.rows.forEach(function (r) { nowMap[r.id] = ratingOf(r); });
-        card.appendChild(h('h3', { text: 'Compared with the previous submission' }));
-        card.appendChild(renderCompare(mapFromCriteria(state.net.detail.criteria, last.SubmissionNo), nowMap, 'Submission #' + last.SubmissionNo, 'This evaluation'));
+        var own = state.saved ? state.saved.programId + '-S' + state.saved.submissionNo : '';
+        var subs = state.net.detail.submissions.filter(function (x) { return String(x.SubmissionID) !== own; });
+        if (subs.length) {
+          var last = subs[subs.length - 1], nowMap = {}; state.rows.forEach(function (r) { nowMap[r.id] = ratingOf(r); });
+          card.appendChild(h('h3', { text: 'Compared with the previous submission' }));
+          card.appendChild(renderCompare(mapFromCriteria(state.net.detail.criteria, last.SubmissionNo), nowMap, 'Submission #' + last.SubmissionNo, 'This evaluation'));
+        }
       }
-      var res = h('div', { 'aria-live': 'polite' });
-      var save = h('button', { class: 'btn primary', type: 'button', text: 'Save to the log', disabled: !chk.ok || !!state.saved });
-      save.addEventListener('click', function () {
-        save.disabled = true; res.innerHTML = ''; res.appendChild(msg('info', 'Saving…'));
-        var payload = {
-          clientKey: state.clientKey, promptVersion: D.PROMPT_VERSION,
-          program: { programId: m.mode === 'resub' ? m.programId : '', district: m.district, school: schoolName(), proponent: (m.proponent || '').trim(), title: (m.title || '').trim(), type: m.type || 'Not stated', dateReceived: m.dateReceived || '' },
-          submission: { evaluator: (m.evaluator || '').trim() },
-          criteria: state.rows.map(function (r, i) {
-            var rt = ratingOf(r), gap = rt && rt !== 'FULLY';
-            return { id: r.id, component: STD[i].comp, rating: rt, marks: r.marks.every(function (x) { return x !== null; }) ? r.marks.map(function (x) { return x ? 'Y' : 'N'; }).join('') : '', aiRating: r.aiRating || '', evidence: r.loc || '',
-              comments: gap ? r.items.map(function (c) { return { verb: c.verb.trim(), elements: c.elements.trim(), qual: c.qual.trim() }; }) : [] };
-          }),
-          recs: chk.recs.map(function (r) { return { ids: String(r.ids).replace(/\s+/g, ''), verb: r.verb.trim(), q1: r.q1.trim(), elements: r.elements.trim(), q2: r.q2.trim() }; }),
-          recommendation: { yes: model.rec.yes, returnFor: model.rec.yes ? [] : (model.rec.compliance ? ['compliance'] : []).concat(model.rec.tech ? ['technical_assistance'] : []) }
-        };
-        api('submit', null, payload).then(function (j) {
-          res.innerHTML = '';
-          if (j.ok) {
-            state.saved = { programId: j.programId, submissionNo: j.submissionNo }; state.net.programs = null; state.net.log = null;
-            res.appendChild(msg('ok', (j.duplicate ? 'Already saved earlier: ' : 'Saved: ') + 'Submission #' + j.submissionNo + ' of program ' + j.programId + (j.submissionNo === 1 ? ' (first submission).' : '.')));
-            res.appendChild(h('div', { class: 'row', style: 'margin-top:8px' }, h('button', { class: 'btn', type: 'button', text: 'Open the log', onclick: function () { go('log'); } })));
-          } else { res.appendChild(msg('bad', errText(j))); save.disabled = false; if (j.error === 'bad_code') drawLog(); }
-        });
-      });
-      card.appendChild(h('div', { class: 'row', style: 'margin-top:8px' }, save)); card.appendChild(res);
-      if (state.saved) res.appendChild(msg('ok', 'Saved: Submission #' + state.saved.submissionNo + ' of program ' + state.saved.programId + '. To log another evaluation, start a new one.'));
+      var st = h('div', { class: 'logstat', 'aria-live': 'polite' }); card.appendChild(st); renderLogStat(st);
+      card.appendChild(h('div', { class: 'row', style: 'margin-top:8px' },
+        h('button', { class: 'btn small', type: 'button', text: 'Save again now', onclick: function () { autoSave(); } }),
+        state.saved ? h('button', { class: 'btn small', type: 'button', text: 'Open the log', onclick: function () { go('log'); } }) : null));
       logCard.appendChild(card);
+      if (chk.ok && counts().blocks === 0 && (!state.saved || state.dirty) && !state.saving) autoSave();
     }
     state.refreshLogChecks = null;
     drawLog();
-    if (logOn() && state.net.connected && state.meta.mode === 'resub' && state.meta.programId && !state.net.detail) loadDetail(state.meta.programId).then(drawLog);
+    if (logOn() && state.net.connected && state.meta.mode === 'resub' && state.meta.programId && !state.net.detail) loadDetail(state.meta.programId).then(function () { if (state.step === 4) drawLog(); });
     $main.appendChild(h('div', { class: 'row' }, h('button', { class: 'btn', type: 'button', text: 'Back to the review', onclick: function () { go(3); } }),
       h('button', { class: 'btn', type: 'button', text: 'Start a new evaluation', onclick: function (e) {
         var b = e.target;
         if (b.getAttribute('data-sure') !== '1') { b.setAttribute('data-sure', '1'); b.textContent = 'Click again to clear this evaluation'; return; }
-        state.rows = null; state.pasted = ''; state.parseInfo = null; state.recs = []; state.meta = newMeta(state.meta.evaluator); state.clientKey = uuid(); state.saved = null; state.net.detail = null; state.schoolHint = ''; saveLocal(); go(1);
+        clearTimeout(state.saveTimer); state.rows = null; state.pasted = ''; state.parseInfo = null; state.recs = []; state.meta = newMeta(state.meta.evaluator); state.clientKey = uuid(); state.saved = null; state.dirty = false; state.saving = null; state.pending = false; state.saveErr = null; state.net.detail = null; state.schoolHint = ''; saveLocal(); go(1);
       } })));
   }
 
